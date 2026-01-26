@@ -1,0 +1,14 @@
+# Virtual Environment
+nepal_env/
+
+# Python Cache
+__pycache__/
+*.py[cod]
+*$py.class
+
+# OS Files
+.DS_Store
+Thumbs.db
+
+# Config Examples (Optional, but keeping local config for now as requested)
+# floorsheet_config.json
