@@ -3,10 +3,37 @@ import json
 import requests
 import urllib3
 import time
+import sys
+import os
+from datetime import datetime
 from playwright.sync_api import sync_playwright
 
 # Suppress SSL warnings
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
+class DualLogger:
+    """
+    Redirects stdout to both the terminal and a file.
+    """
+    def __init__(self, filename):
+        self.terminal = sys.stdout
+        self.log = open(filename, "w", encoding="utf-8")
+
+    def write(self, message):
+        self.terminal.write(message)
+        self.log.write(message)
+
+    def flush(self):
+        self.terminal.flush()
+        self.log.flush()
+
+    def __enter__(self):
+        sys.stdout = self
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        sys.stdout = self.terminal
+        self.log.close()
 
 def get_top_brokers_from_sharesansar(num_brokers=5, side='buyer', target_date=None):
     """
@@ -29,9 +56,21 @@ def get_top_brokers_from_sharesansar(num_brokers=5, side='buyer', target_date=No
             
             # If a specific date is requested, set it and search
             if target_date:
-                page.evaluate(f'document.getElementById("date").value = "{target_date}"')
+                print(f"Applying date filter: {target_date}")
+                page.click("#date")
+                page.keyboard.press("Control+A")
+                page.keyboard.press("Backspace")
+                page.keyboard.type(target_date)
+                page.keyboard.press("Enter")
+                
+                # Double check the value
+                val = page.input_value("#date")
+                print(f"Date input value after typing: {val}")
+                
                 page.click("#btn_topbrokers_submit")
-                page.wait_for_timeout(3000) 
+                # Wait for the table row 1 to potentially change or page to reload
+                page.wait_for_load_state("networkidle")
+                time.sleep(3) 
 
             # Click "Difference (Rs.)" header to sort
             header = page.locator("th:has-text('Difference (Rs.)')")
@@ -267,81 +306,112 @@ def main():
     parser.add_argument("--add", action="store_true", default=def_aggregate, help="Enable stock aggregation (Add/Compare)")
     parser.add_argument("--self-trades", action="store_true", help="Include self-trades in results (Default: Ignored)")
     parser.add_argument("--turnover", type=int, default=def_turnover_limit, help=f"Match results against Top N turnover stocks in summary (default: {def_turnover_limit})")
-    
     args = parser.parse_args()
     
     side = 'seller' if args.seller else ('buyer' if args.buyer else def_side)
     
-    broker_list = []
-    if args.broker:
-        for item in args.broker:
-            if ',' in item:
-                broker_list.extend([int(x.strip()) for x in item.split(',') if x.strip().isdigit()])
-            elif item.isdigit():
-                broker_list.append(int(item))
-    elif def_brokers:
-        broker_list = def_brokers if isinstance(def_brokers, list) else [def_brokers]
-    else:
-        broker_list = get_top_brokers_from_sharesansar(args.num_brokers, side, args.discovery_date)
-
-    if not broker_list:
-        print("Error: No brokers specified and discovery failed.")
-        return
-
-    include_self = args.self_trades or (not def_ignore_self)
-
-    auth_data = get_auth_data_from_network()
-    if not auth_data["token"] or not auth_data["payload"]:
-        print("Error: Could not retrieve NEPSE session data.")
-        return
-
-    turnover_info_map = get_top_turnover_stocks(auth_data["token"], args.turnover)
-
-    print(f"Target Brokers: {broker_list}")
-    print(f"Settings: Side={side.capitalize()}, Limit={args.limit}, Aggregated={args.add}, IgnoreSelfTrades={not include_self}, TurnoverMatch={args.turnover}")
+    # Setup File Logging
+    date_str = datetime.now().strftime("%Y-%m-%d")
+    # include timestamp to avoid overwrites if run multiple times
+    timestamp = datetime.now().strftime("%H%M%S")
+    reports_dir = "reports"
+    if not os.path.exists(reports_dir):
+        os.makedirs(reports_dir)
     
-    per_broker_full_results = []
-
-    for b_id in broker_list:
-        print(f"\n{'='*20} Broker {b_id} {'='*20}")
-        try:
-            data = fetch_floorsheet(auth_token=auth_data["token"], payload=auth_data["payload"], broker_id=b_id, sort="quantity,desc")
-            
-            items = []
-            if isinstance(data, list):
-                items = data
-            elif isinstance(data, dict):
-                items = data.get("floorsheets", {}).get("content", []) or data.get("content", [])
-            
-            # Analyze ALL items for the per-broker report
-            limit = len(items) if args.all else args.limit
-            broker_results = analyze_data(items, limit, aggregate=args.add, include_self_trades=include_self, turnover_info_map=turnover_info_map)
-            
-            if broker_results:
-                per_broker_full_results.append({"broker": b_id, "results": broker_results})
-            
-        except Exception as e:
-            print(f"Error for Broker {b_id}: {e}")
-
-    # Final High-Signal Summary (Strictly filtered)
-    if per_broker_full_results:
-        print(f"\n\n{'#'*30} HIGH-SIGNAL MARKET IMPACT SUMMARY {'#'*30}")
-        print(f"Stocks listed below are Top Broker favorites that are ALSO in the Market's Top {args.turnover} Turnover.")
-        print("-" * 115)
-        print(f"{'S.N.':<5} | {'Broker':<8} | {'Stock':<10} | {'Quantity':<15} | {'Mkt Vol Rank':<12} | {'LTP':<10} | {'Mkt Turnover':<20}")
-        print("-" * 115)
-        sn = 1
-        for entry in per_broker_full_results:
-            b_id = entry["broker"]
-            for res in entry["results"]:
-                # ONLY show if it has a turnover rank (meaning it was in the Top N list)
-                if res['rank'] != "-":
-                    print(f"{sn:<5} | {b_id:<8} | {res['stock']:<10} | {res['qty']:<15} | {res['rank']:<12} | {res['ltp']:<10} | {res['turnover']:<20}")
-                    sn += 1
+    log_file = os.path.join(reports_dir, f"report-{date_str}_{timestamp}_{side}.txt")
+    
+    with DualLogger(log_file):
+        print(f"--- Analysis Session Started: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} ---")
+        print(f"Archiving report to: {log_file}")
         
-        if sn == 1:
-            print("No high-signal matches found for the analyzed brokers.")
-        print("-" * 115)
+        # Resolve Discovery Date (Interactive)
+        discovery_date = args.discovery_date if args.discovery_date else def_disc_date
+        if discovery_date is None:
+            print("\n--- Discovery Date ---")
+            user_date = input("Enter Historical Date (YYYY-MM-DD) or [Enter] for Latest: ").strip()
+            discovery_date = user_date if user_date else None
+
+        broker_list = []
+        if args.broker:
+            for item in args.broker:
+                if ',' in item:
+                    broker_list.extend([int(x.strip()) for x in item.split(',') if x.strip().isdigit()])
+                elif item.isdigit():
+                    broker_list.append(int(item))
+        elif def_brokers:
+            broker_list = def_brokers if isinstance(def_brokers, list) else [def_brokers]
+        
+        if not broker_list:
+            print("\n--- Broker IDs ---")
+            user_brokers = input("Enter Broker IDs (e.g. 44, 58) or [Enter] to Discover Top Brokers: ").strip()
+            if user_brokers:
+                for item in user_brokers.split(','):
+                    if item.strip().isdigit():
+                        broker_list.append(int(item.strip()))
+            else:
+                # Only if no IDs provided, perform discovery
+                broker_list = get_top_brokers_from_sharesansar(args.num_brokers, side, discovery_date)
+
+        if not broker_list:
+            print("Error: No brokers specified and discovery failed.")
+            return
+
+        include_self = args.self_trades or (not def_ignore_self)
+
+        auth_data = get_auth_data_from_network()
+        if not auth_data["token"] or not auth_data["payload"]:
+            print("Error: Could not retrieve NEPSE session data.")
+            return
+
+        turnover_info_map = get_top_turnover_stocks(auth_data["token"], args.turnover)
+
+        print(f"Target Brokers: {broker_list}")
+        print(f"Settings: Side={side.capitalize()}, Limit={args.limit}, Aggregated={args.add}, IgnoreSelfTrades={not include_self}, TurnoverMatch={args.turnover}")
+        
+        per_broker_full_results = []
+
+        for b_id in broker_list:
+            print(f"\n{'='*20} Broker {b_id} {'='*20}")
+            try:
+                data = fetch_floorsheet(auth_token=auth_data["token"], payload=auth_data["payload"], broker_id=b_id, sort="quantity,desc")
+                
+                items = []
+                if isinstance(data, list):
+                    items = data
+                elif isinstance(data, dict):
+                    items = data.get("floorsheets", {}).get("content", []) or data.get("content", [])
+                
+                # Analyze ALL items for the per-broker report
+                limit = len(items) if args.all else args.limit
+                broker_results = analyze_data(items, limit, aggregate=args.add, include_self_trades=include_self, turnover_info_map=turnover_info_map)
+                
+                if broker_results:
+                    per_broker_full_results.append({"broker": b_id, "results": broker_results})
+                
+            except Exception as e:
+                print(f"Error for Broker {b_id}: {e}")
+
+        # Final High-Signal Summary (Strictly filtered)
+        if per_broker_full_results:
+            print(f"\n\n{'#'*30} HIGH-SIGNAL MARKET IMPACT SUMMARY {'#'*30}")
+            print(f"Stocks listed below are Top Broker favorites that are ALSO in the Market's Top {args.turnover} Turnover.")
+            print("-" * 115)
+            print(f"{'S.N.':<5} | {'Broker':<8} | {'Stock':<10} | {'Quantity':<15} | {'Mkt Vol Rank':<12} | {'LTP':<10} | {'Mkt Turnover':<20}")
+            print("-" * 115)
+            sn = 1
+            for entry in per_broker_full_results:
+                b_id = entry["broker"]
+                for res in entry["results"]:
+                    # ONLY show if it has a turnover rank (meaning it was in the Top N list)
+                    if res['rank'] != "-":
+                        print(f"{sn:<5} | {b_id:<8} | {res['stock']:<10} | {res['qty']:<15} | {res['rank']:<12} | {res['ltp']:<10} | {res['turnover']:<20}")
+                        sn += 1
+            
+            if sn == 1:
+                print("No high-signal matches found for the analyzed brokers.")
+            print("-" * 115)
+        
+        print(f"\n--- Analysis Session Finished: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} ---")
 
 if __name__ == "__main__":
     main()

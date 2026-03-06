@@ -1,6 +1,6 @@
 {
-    "default_broker_count": 10,
-    "stocks_per_broker": 3,
+    "default_broker_count": 5,
+    "stocks_per_broker": 5,
     "aggregate_stocks": true,
     "show_all_results": false,
     "ignore_self_trades": true,
